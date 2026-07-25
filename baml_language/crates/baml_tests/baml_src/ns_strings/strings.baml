@@ -326,6 +326,44 @@ test "string_index_of_absent_is_null" {
     assert.is_true(baml.deep_equals("abc".index_of("z"), null))
 }
 
+// ─── last_index_of ───────────────────────────────────────────────────────────
+//
+// The mirror of index_of: same codepoint indexing, rightmost match.
+
+test "string_last_index_of" {
+    assert.is_true(baml.deep_equals("hello world hello".last_index_of("hello"), 12))
+}
+
+test "string_last_index_of_is_not_first" {
+    assert.is_true(baml.deep_equals("abcabc".last_index_of("b"), 4))
+}
+
+// Overlapping candidates resolve to the rightmost start that still fits.
+test "string_last_index_of_overlapping" {
+    assert.is_true(baml.deep_equals("aaa".last_index_of("aa"), 1))
+}
+
+test "string_last_index_of_returns_codepoint_index" {
+    assert.is_true(baml.deep_equals("héllo".last_index_of("l"), 3))
+}
+
+test "string_last_index_of_after_emoji" {
+    assert.is_true(baml.deep_equals("😀hello".last_index_of("l"), 4))
+}
+
+test "string_last_index_of_absent_is_null" {
+    assert.is_true(baml.deep_equals("abc".last_index_of("z"), null))
+}
+
+// An empty needle matches at the end, where index_of("") matches at 0.
+test "string_last_index_of_empty_search" {
+    assert.is_true(baml.deep_equals("abc".last_index_of(""), 3))
+}
+
+test "string_last_index_of_empty_receiver" {
+    assert.is_true(baml.deep_equals("".last_index_of("a"), null))
+}
+
 // ─── repeat ──────────────────────────────────────────────────────────────────
 
 test "string_repeat" {
@@ -338,6 +376,75 @@ test "string_repeat_zero" {
 
 test "string_repeat_negative" {
     assert.is_true(baml.deep_equals("ab".repeat(-1), ""))
+}
+
+// ─── pad_start / pad_end ─────────────────────────────────────────────────────
+
+test "string_pad_start" {
+    assert.is_true(baml.deep_equals("7".pad_start(3, "0"), "007"))
+}
+
+test "string_pad_end" {
+    assert.is_true(baml.deep_equals("7".pad_end(3, "0"), "700"))
+}
+
+// A multi-character pad repeats to fill the gap exactly.
+test "string_pad_start_multi_char_pad" {
+    assert.is_true(baml.deep_equals("42".pad_start(6, "ab"), "abab42"))
+}
+
+test "string_pad_end_multi_char_pad" {
+    assert.is_true(baml.deep_equals("42".pad_end(6, "ab"), "42abab"))
+}
+
+// The last repeat is truncated so the result is never longer than the target.
+test "string_pad_start_truncates_pad" {
+    assert.is_true(baml.deep_equals("42".pad_start(5, "ab"), "aba42"))
+}
+
+test "string_pad_end_truncates_pad" {
+    assert.is_true(baml.deep_equals("42".pad_end(5, "ab"), "42aba"))
+}
+
+// Already at or past the target → unchanged, never truncated.
+test "string_pad_start_already_long_enough" {
+    assert.is_true(baml.deep_equals("hello".pad_start(5, " "), "hello"))
+}
+
+test "string_pad_end_longer_than_target" {
+    assert.is_true(baml.deep_equals("hello".pad_end(3, " "), "hello"))
+}
+
+// A negative target is lenient (like repeat), not an error.
+test "string_pad_start_negative_target" {
+    assert.is_true(baml.deep_equals("hi".pad_start(-1, "0"), "hi"))
+}
+
+// An empty pad can never reach the target: unchanged, and must not hang.
+test "string_pad_start_empty_pad" {
+    assert.is_true(baml.deep_equals("hi".pad_start(4, ""), "hi"))
+}
+
+test "string_pad_end_empty_pad" {
+    assert.is_true(baml.deep_equals("hi".pad_end(4, ""), "hi"))
+}
+
+test "string_pad_start_empty_receiver" {
+    assert.is_true(baml.deep_equals("".pad_start(3, "x"), "xxx"))
+}
+
+// Lengths are codepoints, not bytes: a 4-byte emoji counts as one character.
+test "string_pad_start_counts_codepoints" {
+    assert.is_true(baml.deep_equals("é".pad_start(3, "😀"), "😀😀é"))
+}
+
+test "string_pad_end_pads_multibyte_receiver" {
+    assert.is_true(baml.deep_equals("héllo".pad_end(7, "."), "héllo.."))
+}
+
+// The padded result reports the target length, not a byte count.
+test "string_pad_start_result_length" {
+    assert.is_true(baml.deep_equals("😀".pad_start(4, "😀").length(), 4))
 }
 
 // ─── char_count ───────────────────────────────────────────────────────────────

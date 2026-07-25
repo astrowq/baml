@@ -11426,11 +11426,17 @@ fn baml.String.replace = builtin(vm)
 
 fn baml.String.index_of = builtin(vm)
 
+fn baml.String.last_index_of = builtin(vm)
+
 fn baml.String.char_at = builtin(vm)
 
 fn baml.String.code_point_at = builtin(vm)
 
 fn baml.String.repeat = builtin(vm)
+
+fn baml.String.pad_start = builtin(vm)
+
+fn baml.String.pad_end = builtin(vm)
 
 fn baml.String.matches = builtin(vm)
 
