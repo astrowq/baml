@@ -11,7 +11,7 @@ use std::sync::Arc;
 use baml_base::{Name, SourceFile};
 use baml_compiler_diagnostics::diagnostic::DiagnosticId;
 use baml_compiler2_ast::{self as ast, LoweringDiagnostic};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use text_size::{TextRange, TextSize};
 
 use crate::{
@@ -26,8 +26,9 @@ use crate::{
     },
     scope::{FileScopeId, ItemScopeOwner, Scope, ScopeId, ScopeKind},
     semantic_index::{
-        BindingId, DefinitionSite, FileSemanticIndex, LocalBinding, PathResolution, ScopeBindings,
-        SemanticIndexExtra, visible_binding_at_in_scopes,
+        BindingId, DefinitionSite, ExprMetadataKey, ExprMetadataScope, FileSemanticIndex,
+        LocalBinding, PathResolution, ScopeBindings, SemanticIndexExtra,
+        visible_binding_at_in_scopes,
     },
 };
 
@@ -37,6 +38,12 @@ struct PathRootReference {
     use_scope: FileScopeId,
     use_offset: TextSize,
     owner_lambda: Option<FileScopeId>,
+}
+
+#[derive(Default)]
+struct PatternNames {
+    names: FxHashMap<Name, TextRange>,
+    duplicates: FxHashSet<Name>,
 }
 
 /// The head name used to seed an impl's stable `ImplId` from a target
@@ -68,12 +75,13 @@ pub struct SemanticIndexBuilder<'db> {
     /// contribute to top-level symbols — they belong to the class scope).
     class_depth: u32,
 
-    /// Expression → scope mappings, sorted by `ExprId` at the end.
-    expr_scopes: Vec<(ast::ExprId, FileScopeId)>,
+    /// Expression to lexical scope mappings, sorted by arena-safe key at the end.
+    expr_scopes: Vec<(ExprMetadataKey, FileScopeId)>,
 
-    /// Path root resolutions for multi-segment `Path` expressions.
-    /// Collected during `walk_expr_body`, sorted by `ExprId` at the end.
-    path_resolutions: Vec<(ast::ExprId, PathResolution)>,
+    /// Path root resolutions, sorted by arena-safe expression key at the end.
+    path_resolutions: Vec<(ExprMetadataKey, PathResolution)>,
+    /// Arena namespace active while walking an expression body or defaults.
+    expr_metadata_scope_stack: Vec<ExprMetadataScope>,
     /// Path-root references collected while walking source order. Unlike
     /// `expr_scopes`, this carries the scope and innermost lambda context at
     /// collection time so capture analysis does not rely on arena-local `ExprId`s.
@@ -85,6 +93,8 @@ pub struct SemanticIndexBuilder<'db> {
     value_contributions: Vec<(Name, Contribution<'db>)>,
     diagnostics: Vec<Hir2Diagnostic>,
     lowering_diagnostics: Vec<LoweringDiagnostic>,
+    invalid_pattern_bindings: FxHashMap<(FileScopeId, ast::PatId), FxHashSet<Name>>,
+    invalid_pattern_binding_scopes: FxHashMap<(TextRange, ast::PatId), FileScopeId>,
     env_var_refs: Vec<baml_compiler2_ast::EnvVarRef>,
 }
 
@@ -100,6 +110,7 @@ impl<'db> SemanticIndexBuilder<'db> {
             class_depth: 0,
             expr_scopes: Vec::new(),
             path_resolutions: Vec::new(),
+            expr_metadata_scope_stack: Vec::new(),
             path_root_references: Vec::new(),
             lambda_stack: Vec::new(),
             item_tree: crate::item_tree::builder::ItemTreeBuilder::new(),
@@ -107,6 +118,8 @@ impl<'db> SemanticIndexBuilder<'db> {
             value_contributions: Vec::new(),
             diagnostics: Vec::new(),
             lowering_diagnostics: Vec::new(),
+            invalid_pattern_bindings: FxHashMap::default(),
+            invalid_pattern_binding_scopes: FxHashMap::default(),
             env_var_refs: Vec::new(),
         }
     }
@@ -164,10 +177,10 @@ impl<'db> SemanticIndexBuilder<'db> {
         self.pop_scope(); // Project
 
         // Sort expr_scopes for binary search
-        self.expr_scopes.sort_by_key(|(id, _)| *id);
+        self.expr_scopes.sort_by_key(|(key, _)| *key);
 
         // Sort path_resolutions for binary search
-        self.path_resolutions.sort_by_key(|(id, _)| *id);
+        self.path_resolutions.sort_by_key(|(key, _)| *key);
 
         // Pre-intern ScopeIds for each FileScopeId
         let scope_ids: Vec<ScopeId<'db>> = (0..self.scopes.len())
@@ -177,12 +190,17 @@ impl<'db> SemanticIndexBuilder<'db> {
             })
             .collect();
 
-        let extra = if self.diagnostics.is_empty() && self.lowering_diagnostics.is_empty() {
+        let extra = if self.diagnostics.is_empty()
+            && self.lowering_diagnostics.is_empty()
+            && self.invalid_pattern_bindings.is_empty()
+        {
             None
         } else {
             Some(Box::new(SemanticIndexExtra {
                 diagnostics: self.diagnostics,
                 lowering_diagnostics: self.lowering_diagnostics,
+                invalid_pattern_bindings: self.invalid_pattern_bindings,
+                invalid_pattern_binding_scopes: self.invalid_pattern_binding_scopes,
             }))
         };
 
@@ -249,8 +267,17 @@ impl<'db> SemanticIndexBuilder<'db> {
     // ── Expression recording ─────────────────────────────────────────────────
 
     /// Record that an expression belongs to the current scope.
+    fn current_expr_metadata_key(&self, expr_id: ast::ExprId) -> ExprMetadataKey {
+        let scope = *self
+            .expr_metadata_scope_stack
+            .last()
+            .expect("expression walked without an arena namespace");
+        ExprMetadataKey::new(scope, expr_id)
+    }
+
     fn record_expr_scope(&mut self, expr_id: ast::ExprId) {
-        self.expr_scopes.push((expr_id, self.current_scope_id()));
+        let key = self.current_expr_metadata_key(expr_id);
+        self.expr_scopes.push((key, self.current_scope_id()));
     }
 
     /// Build a dotted scope path from the current scope stack, e.g. `Foo.Bar`.
@@ -312,9 +339,30 @@ impl<'db> SemanticIndexBuilder<'db> {
     /// Walk an `ExprBody` arena in source order, recording expression ownership
     /// and local bindings in the lexical scope that owns each expression.
     fn walk_expr_body(&mut self, body: &ast::ExprBody, source_map: &ast::AstSourceMap) {
+        let metadata_scope = ExprMetadataScope::Body(self.current_scope_id());
+        self.expr_metadata_scope_stack.push(metadata_scope);
         if let Some(root_expr) = body.root_expr {
             self.walk_expr(root_expr, body, source_map, false);
         }
+        let popped = self.expr_metadata_scope_stack.pop();
+        debug_assert_eq!(popped, Some(metadata_scope));
+    }
+
+    fn walk_parameter_defaults(&mut self, function: &ast::FunctionDef) {
+        let metadata_scope = ExprMetadataScope::ParameterDefault(self.current_scope_id());
+        self.expr_metadata_scope_stack.push(metadata_scope);
+        for param in &function.params {
+            if let Some(default) = param.default {
+                self.walk_expr(
+                    default.expr(),
+                    &function.defaults.exprs,
+                    &function.defaults.source_map,
+                    true,
+                );
+            }
+        }
+        let popped = self.expr_metadata_scope_stack.pop();
+        debug_assert_eq!(popped, Some(metadata_scope));
     }
 
     /// Walk an expression, recording its `FileScopeId` and (for `Block`s)
@@ -669,9 +717,7 @@ impl<'db> SemanticIndexBuilder<'db> {
                     let use_scope = self.current_scope_id();
                     let use_offset = source_map.expr_span(expr_id).start();
                     self.record_path_root_reference(root, use_scope, use_offset);
-                    if segments.len() >= 2 {
-                        self.classify_path_expr(expr_id, segments, use_scope, use_offset);
-                    }
+                    self.resolve_path_expr(expr_id, root, use_scope, use_offset);
                 }
             }
             ast::Expr::GenericApply { base, .. } => {
@@ -779,8 +825,15 @@ impl<'db> SemanticIndexBuilder<'db> {
         let names =
             Self::collect_pattern_names(&body.patterns, pat_id, source_map, &mut self.diagnostics);
 
-        for (name, name_range) in names {
-            let scope_id = self.current_scope_id();
+        let scope_id = self.current_scope_id();
+        if !names.duplicates.is_empty() {
+            self.invalid_pattern_bindings
+                .insert((scope_id, pat_id), names.duplicates);
+            self.invalid_pattern_binding_scopes
+                .insert((source_map.pattern_span(pat_id), pat_id), scope_id);
+        }
+
+        for (name, name_range) in names.names {
             self.scope_bindings[scope_id.index() as usize]
                 .bindings
                 .push(LocalBinding {
@@ -810,20 +863,22 @@ impl<'db> SemanticIndexBuilder<'db> {
         pat_id: ast::PatId,
         source_map: &ast::AstSourceMap,
         diagnostics: &mut Vec<Hir2Diagnostic>,
-    ) -> FxHashMap<Name, TextRange> {
+    ) -> PatternNames {
         match &patterns[pat_id] {
-            ast::Pattern::Wildcard | ast::Pattern::Type(_) => FxHashMap::default(),
+            ast::Pattern::Wildcard | ast::Pattern::Type(_) => PatternNames::default(),
             ast::Pattern::Bind { name, subpat } => {
-                let mut m = FxHashMap::default();
-                m.insert(name.clone(), source_map.pattern_span(pat_id));
+                let mut result = PatternNames::default();
+                result
+                    .names
+                    .insert(name.clone(), source_map.pattern_span(pat_id));
                 if let Some(sp) = subpat {
                     let inner = Self::collect_pattern_names(patterns, *sp, source_map, diagnostics);
-                    Self::merge_with_dup_check(&mut m, inner, diagnostics);
+                    Self::merge_with_dup_check(&mut result, inner, diagnostics);
                 }
-                m
+                result
             }
             ast::Pattern::Class { fields, .. } => {
-                let mut m: FxHashMap<Name, TextRange> = FxHashMap::default();
+                let mut result = PatternNames::default();
                 let mut seen_fields: FxHashMap<Name, Vec<TextRange>> = FxHashMap::default();
                 for f in fields {
                     seen_fields
@@ -832,14 +887,14 @@ impl<'db> SemanticIndexBuilder<'db> {
                         .push(f.field_span);
                     let inner =
                         Self::collect_pattern_names(patterns, f.pat, source_map, diagnostics);
-                    Self::merge_with_dup_check(&mut m, inner, diagnostics);
+                    Self::merge_with_dup_check(&mut result, inner, diagnostics);
                 }
                 for (name, sites) in seen_fields {
                     if sites.len() > 1 {
                         diagnostics.push(Hir2Diagnostic::DuplicatePatternField { name, sites });
                     }
                 }
-                m
+                result
             }
             ast::Pattern::Array {
                 prefix,
@@ -847,41 +902,46 @@ impl<'db> SemanticIndexBuilder<'db> {
                 suffix,
                 ascription: _,
             } => {
-                let mut m: FxHashMap<Name, TextRange> = FxHashMap::default();
+                let mut result = PatternNames::default();
                 for id in prefix {
                     let inner = Self::collect_pattern_names(patterns, *id, source_map, diagnostics);
-                    Self::merge_with_dup_check(&mut m, inner, diagnostics);
+                    Self::merge_with_dup_check(&mut result, inner, diagnostics);
                 }
                 if let Some(rest) = rest
                     && let Some(id) = rest.pat
                 {
                     let inner = Self::collect_pattern_names(patterns, id, source_map, diagnostics);
-                    Self::merge_with_dup_check(&mut m, inner, diagnostics);
+                    Self::merge_with_dup_check(&mut result, inner, diagnostics);
                 }
                 for id in suffix {
                     let inner = Self::collect_pattern_names(patterns, *id, source_map, diagnostics);
-                    Self::merge_with_dup_check(&mut m, inner, diagnostics);
+                    Self::merge_with_dup_check(&mut result, inner, diagnostics);
                 }
-                m
+                result
             }
             ast::Pattern::Or(parts) => {
                 // Each alternative is its own branch. Collect them
                 // independently; duplicates are checked per-branch (already
                 // done by the recursive call), and across-branch parity is
                 // checked here.
-                let branch_sets: Vec<FxHashMap<Name, TextRange>> = parts
+                let branch_sets: Vec<PatternNames> = parts
                     .iter()
                     .map(|id| Self::collect_pattern_names(patterns, *id, source_map, diagnostics))
                     .collect();
 
+                let duplicates = branch_sets
+                    .iter()
+                    .flat_map(|branch| branch.duplicates.iter().cloned())
+                    .collect();
                 let mut has_mismatch = false;
                 if let Some(first) = branch_sets.first() {
-                    let first_names: std::collections::BTreeSet<&Name> = first.keys().collect();
+                    let first_names: std::collections::BTreeSet<&Name> =
+                        first.names.keys().collect();
                     let mut mismatched: std::collections::BTreeSet<Name> =
                         std::collections::BTreeSet::new();
                     for branch in &branch_sets[1..] {
                         let branch_names: std::collections::BTreeSet<&Name> =
-                            branch.keys().collect();
+                            branch.names.keys().collect();
                         for n in first_names.symmetric_difference(&branch_names) {
                             mismatched.insert((*n).clone());
                         }
@@ -912,11 +972,20 @@ impl<'db> SemanticIndexBuilder<'db> {
                     // (`let x | _` vs `_ | let x` would otherwise behave
                     // differently). The primary diagnostic above captures
                     // the error.
-                    FxHashMap::default()
+                    PatternNames {
+                        names: FxHashMap::default(),
+                        duplicates,
+                    }
                 } else {
                     // Every branch introduces the same set, so the first
                     // branch's contribution is representative.
-                    branch_sets.into_iter().next().unwrap_or_default()
+                    PatternNames {
+                        names: branch_sets
+                            .into_iter()
+                            .next()
+                            .map_or_else(FxHashMap::default, |branch| branch.names),
+                        duplicates,
+                    }
                 }
             }
         }
@@ -925,18 +994,20 @@ impl<'db> SemanticIndexBuilder<'db> {
     /// Merge `source` into `target`. Any name already present in `target`
     /// produces a `DuplicatePatternBinding` diagnostic.
     fn merge_with_dup_check(
-        target: &mut FxHashMap<Name, TextRange>,
-        source: FxHashMap<Name, TextRange>,
+        target: &mut PatternNames,
+        source: PatternNames,
         diagnostics: &mut Vec<Hir2Diagnostic>,
     ) {
-        for (name, range) in source {
-            if let Some(prev) = target.get(&name) {
+        target.duplicates.extend(source.duplicates);
+        for (name, range) in source.names {
+            if let Some(prev) = target.names.get(&name) {
                 diagnostics.push(Hir2Diagnostic::DuplicatePatternBinding {
                     name: name.clone(),
                     sites: vec![*prev, range],
                 });
+                target.duplicates.insert(name);
             } else {
-                target.insert(name, range);
+                target.names.insert(name, range);
             }
         }
     }
@@ -1054,16 +1125,7 @@ impl<'db> SemanticIndexBuilder<'db> {
         }
         self.emit_duplicate_param_diagnostics(&func_def.params);
         self.lambda_stack.push(scope_id);
-        for param in &func_def.params {
-            if let Some(default) = param.default {
-                self.walk_expr(
-                    default.expr(),
-                    &func_def.defaults.exprs,
-                    &func_def.defaults.source_map,
-                    true,
-                );
-            }
-        }
+        self.walk_parameter_defaults(func_def);
         if let Some(ast::FunctionBodyDef::Expr(lambda_body, lambda_source_map)) = &func_def.body {
             self.walk_expr_body(lambda_body, lambda_source_map);
             self.analyze_lambda_captures(scope_id, lambda_body, lambda_source_map);
@@ -1130,26 +1192,18 @@ impl<'db> SemanticIndexBuilder<'db> {
         false
     }
 
-    fn classify_path_expr(
+    fn resolve_path_expr(
         &mut self,
         expr_id: ast::ExprId,
-        segments: &[Name],
+        root: &Name,
         use_scope: FileScopeId,
         use_offset: TextSize,
     ) {
-        if segments.len() < 2 {
-            return;
-        }
-        let root = &segments[0];
-        let resolution = if self
+        let resolution = self
             .visible_binding_at(use_scope, use_offset, root)
-            .is_some()
-        {
-            PathResolution::Local { name: root.clone() }
-        } else {
-            PathResolution::Unknown
-        };
-        self.path_resolutions.push((expr_id, resolution));
+            .map_or(PathResolution::Unknown, PathResolution::Local);
+        let key = self.current_expr_metadata_key(expr_id);
+        self.path_resolutions.push((key, resolution));
     }
 
     fn record_path_root_reference(
@@ -1212,16 +1266,7 @@ impl<'db> SemanticIndexBuilder<'db> {
                 .push((param.name.clone(), idx));
         }
         self.emit_duplicate_param_diagnostics(&f.params);
-        for param in &f.params {
-            if let Some(default) = param.default {
-                self.walk_expr(
-                    default.expr(),
-                    &f.defaults.exprs,
-                    &f.defaults.source_map,
-                    true,
-                );
-            }
-        }
+        self.walk_parameter_defaults(f);
 
         if let Some(ast::FunctionBodyDef::Expr(ref body, ref source_map)) = f.body {
             self.walk_expr_body(body, source_map);

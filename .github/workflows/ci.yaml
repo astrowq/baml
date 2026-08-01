@@ -56,6 +56,8 @@ jobs:
       prof: ${{ steps.check_prof.outputs.changed }}
       # Flag for inputs that can change the shipping bridge_cffi binaries
       bridge_cffi_release: ${{ steps.check_bridge_cffi_release.outputs.changed }}
+      # Flag for SDK test changes - triggers the SDK parity analysis pipeline
+      sdk_tests: ${{ steps.check_sdk_tests.outputs.changed }}
       # Flag that is raised when perf benchmarks (CodSpeed) should run: always
       # after merge (push to main/canary) and on manual dispatch; on PRs only
       # when the PR title/body or a commit message opts in.
@@ -85,7 +87,10 @@ jobs:
             ':scripts/baml-wrapper-version' \
             ':scripts/baml-release-manifests' \
             ':scripts/baml-package-manager-artifacts' \
+            ':scripts/baml-release-platforms' \
+            ':scripts/baml_release_platforms.py' \
             ':scripts/baml-bridge-cffi-hygiene' \
+            ':release/platforms.json' \
             ':scripts/install.sh' \
             ':scripts/install.ps1' \
             ':packaging/aur/**' \
@@ -311,6 +316,44 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Check if SDK tests changed
+        id: check_sdk_tests
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MERGE_BASE: ${{ steps.merge_base.outputs.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          paths=(
+            'baml_language/sdk_tests/**'
+            'baml_language/sdks/README.md'
+            'tools/sdk-parity-lint/**'
+            'mise.toml'
+            '.github/workflows/ci.yaml'
+          )
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$EVENT_NAME" = "push" ]; then
+            if [ -z "$PUSH_BEFORE" ] || [ "$PUSH_BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+            elif git diff --quiet "$PUSH_BEFORE" "$PUSH_AFTER" -- "${paths[@]}"; then
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          if git diff --quiet "${MERGE_BASE}...HEAD" -- "${paths[@]}"; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       # Decide whether perf benchmarks (CodSpeed) should run for this event.
       # Policy: benchmarks run AFTER MERGE (push to main/canary) only when the
       # merge actually touched baml_language/, and on manual dispatch. On PRs
@@ -414,7 +457,9 @@ jobs:
       - name: "Install mise"
         uses: ./.github/actions/setup-mise
         with:
-          install_args: "cargo:prek cargo:https://github.com/astral-sh/hawk python uv"
+          # Temporarily omit Hawk while its CI check is disabled.
+          # install_args: "cargo:prek cargo:https://github.com/astral-sh/hawk python uv"
+          install_args: "cargo:prek python uv"
 
       - name: "Cache prek"
         uses: actions/cache@v5
@@ -870,6 +915,49 @@ jobs:
           fi
           echo "All generated proto files are in sync."
 
+  sdk_parity_check:
+    name: "SDK parity lint"
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    needs: determine_changes
+    if: needs.determine_changes.outputs.sdk_tests == 'true'
+    timeout-minutes: 15
+    steps:
+      - name: "Checkout Branch"
+        uses: useblacksmith/checkout@v1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: "Install mise"
+        uses: ./.github/actions/setup-mise
+        with:
+          install_args: "ast-grep"
+
+      - name: "Install Rust toolchain"
+        working-directory: baml_language
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "baml_language -> target"
+          save-if: ${{ github.ref == 'refs/heads/canary' }}
+          shared-key: "sdk-parity-baml-cli"
+
+      - name: "Build local BAML CLI"
+        run: cargo build --manifest-path baml_language/Cargo.toml -p baml_cli --bin baml-cli
+
+      - name: "Run SDK parity analysis"
+        run: tools/sdk-parity-lint/run --repo-root . --baseline baml_language/sdk_tests/crates/parity_analysis.md --output baml_language/sdk_tests/crates/parity_analysis.new.md
+
+      - name: "Upload parity results"
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sdk-parity-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: baml_language/sdk_tests/crates/parity_analysis.new.md
+          if-no-files-found: ignore
+          retention-days: 14
+
   # Benchmarks are split into two jobs so the slow compile happens on a fast,
   # cheap machine while the actual measurement happens on a stable CodSpeed
   # macro runner.
@@ -1146,6 +1234,7 @@ jobs:
       # - miri-tests  # TEMPORARILY DISABLED: miri tests timing out
       - prof-concurrency
       - proto-sync
+      - sdk_parity_check
       # NOTE: size-gate is intentionally NOT a required gate. It is an
       # informational signal (PR comment + daily baseline auto-refresh), not
       # a merge blocker: a size bump must never block the merge queue or force
@@ -1174,6 +1263,7 @@ jobs:
           # echo "| miri-tests | ${{ needs.miri-tests.result }} |" >> $GITHUB_STEP_SUMMARY  # TEMPORARILY DISABLED
           echo "| prof-concurrency | ${{ needs.prof-concurrency.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| proto-sync | ${{ needs.proto-sync.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| sdk-parity-check | ${{ needs.sdk_parity_check.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "::error::One or more CI jobs failed!"
           exit 1
@@ -1201,6 +1291,7 @@ jobs:
       # - miri-tests  # TEMPORARILY DISABLED: miri tests timing out
       - prof-concurrency
       - proto-sync
+      - sdk_parity_check
     # `!failure() && !cancelled()` rather than `success()`, because that is what
     # the old `workflow_run.conclusion == 'success'` gate meant: a skipped gate
     # is not a failure. prof-concurrency and proto-sync are change-detected with
@@ -1209,18 +1300,52 @@ jobs:
     if: ${{ !failure() && !cancelled() && github.event_name == 'push' && github.ref_name == 'canary' }}
     permissions:
       actions: write
-      contents: read
+      contents: write
     steps:
-      - name: Dispatch release for this commit
+      - name: Create immutable release workflow ref
+        id: release-workflow-ref
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # --ref canary selects the workflow *definition* from canary HEAD;
-          # source_sha pins the commit that actually gets built and released.
+          release_ref="baml-language-source-$GITHUB_SHA"
+          ref_endpoint="repos/$GITHUB_REPOSITORY/git/ref/tags/$release_ref"
+
+          if ref_json="$(gh api "$ref_endpoint" 2>/dev/null)"; then
+            :
+          elif gh api \
+            --method POST \
+            "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/tags/$release_ref" \
+            -f sha="$GITHUB_SHA" >/dev/null; then
+            ref_json="$(gh api "$ref_endpoint")"
+          else
+            # A rerun can race another attempt creating the same immutable tag.
+            # Re-read it and fail below unless it is the exact ref we intended.
+            ref_json="$(gh api "$ref_endpoint")"
+          fi
+
+          ref_type="$(jq -r '.object.type // ""' <<<"$ref_json")"
+          ref_sha="$(jq -r '.object.sha // ""' <<<"$ref_json")"
+          if [[ "$ref_type" != "commit" || "$ref_sha" != "$GITHUB_SHA" ]]; then
+            echo "::error::release ref $release_ref resolves to $ref_type $ref_sha, expected commit $GITHUB_SHA"
+            exit 1
+          fi
+
+          echo "ref=$release_ref" >> "$GITHUB_OUTPUT"
+          echo "Release workflow ref: $release_ref ($ref_sha)"
+
+      - name: Dispatch release for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_WORKFLOW_REF: ${{ steps.release-workflow-ref.outputs.ref }}
+        run: |
+          set -euo pipefail
+          # Load the workflow definition from the same immutable commit that the
+          # release checks out, even if canary advances while this CI run finishes.
           gh workflow run release-baml-language.yml \
             --repo "$GITHUB_REPOSITORY" \
-            --ref canary \
+            --ref "$RELEASE_WORKFLOW_REF" \
             -f channel=auto \
             -f dry_run=false \
             -f source_sha="$GITHUB_SHA" \
