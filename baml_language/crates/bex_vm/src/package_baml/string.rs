@@ -16,6 +16,31 @@ fn char_substrings(string: &BexStr) -> Vec<BexStr> {
         .collect()
 }
 
+/// The fill `pad_start` / `pad_end` prepend or append: `pad` repeated and then
+/// truncated to exactly the number of codepoints `string` is short of
+/// `target_length`.
+///
+/// `None` means "no padding applies", so the caller returns the string
+/// untouched: it is already long enough, `target_length` is negative, or `pad`
+/// is empty (an empty pad can never reach the target — repeating it would spin
+/// forever).
+fn pad_fill(string: &BexStr, target_length: i64, pad: &BexStr) -> Option<BexStr> {
+    // A negative `target_length` fails the conversion, matching `repeat`'s
+    // "negative counts are treated as 0" leniency rather than raising.
+    let target = usize::try_from(target_length).ok()?;
+    let missing = target.checked_sub(string.char_count())?;
+    if missing == 0 || pad.is_empty() {
+        return None;
+    }
+    let pad_chars = pad.char_count();
+    // Codepoint-counted, so a multi-char `pad` lands on a character boundary and
+    // the final `substring_by_char` trims any overshoot from the last repeat.
+    Some(
+        pad.repeat(missing.div_ceil(pad_chars))
+            .substring_by_char(0, missing),
+    )
+}
+
 impl BamlClassString for PackageBamlImpl {
     #[allow(clippy::cast_possible_wrap)]
     fn length(string: &BexStr) -> i64 {
@@ -135,6 +160,11 @@ impl BamlClassString for PackageBamlImpl {
         string.char_index_of(search.as_str()).map(|i| i as i64)
     }
 
+    #[allow(clippy::cast_possible_wrap)]
+    fn last_index_of(string: &BexStr, search: &BexStr) -> Option<i64> {
+        string.char_last_index_of(search.as_str()).map(|i| i as i64)
+    }
+
     fn char_at(string: &BexStr, index: i64) -> Result<BexStr, VmRustFnError> {
         // Codepoint-indexed, not byte-indexed. A negative index counts from the
         // end; an out-of-bounds index raises `IndexOutOfBounds` (like `array[i]`),
@@ -161,6 +191,20 @@ impl BamlClassString for PackageBamlImpl {
     fn repeat(string: &BexStr, count: i64) -> BexStr {
         let count = usize::try_from(count.max(0)).unwrap_or(0);
         string.repeat(count)
+    }
+
+    fn pad_start(string: &BexStr, target_length: i64, pad: &BexStr) -> BexStr {
+        match pad_fill(string, target_length, pad) {
+            Some(fill) => BexStr::concat(fill, string.clone()),
+            None => string.clone(),
+        }
+    }
+
+    fn pad_end(string: &BexStr, target_length: i64, pad: &BexStr) -> BexStr {
+        match pad_fill(string, target_length, pad) {
+            Some(fill) => BexStr::concat(string.clone(), fill),
+            None => string.clone(),
+        }
     }
 
     fn matches(string: &BexStr, pattern: &BexStr) -> bool {

@@ -43,10 +43,16 @@ methods:
   function replace(self, search: string, replacement: string) -> string
   /// Returns the **character index** of the first occurrence of `search`, or
   function index_of(self, search: string) -> int | null
+  /// Returns the **character index** of the last occurrence of `search`, or
+  function last_index_of(self, search: string) -> int | null
   function char_at(self, index: int) -> string
   function code_point_at(self, index: int) -> int
   /// Returns a new string that repeats `self` the given number of times.
   function repeat(self, count: int) -> string
+  /// Pads the **start** of the string with `pad` until it is `target_length`
+  function pad_start(self, target_length: int, pad: string) -> string
+  /// Pads the **end** of the string with `pad` until it is `target_length`
+  function pad_end(self, target_length: int, pad: string) -> string
   /// Returns true if the string contains the given `substring`.
   function matches(self, substring: string) -> bool
   /// Replaces all occurrences of `search` with `replacement`.

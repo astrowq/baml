@@ -840,6 +840,9 @@ function baml.String.is_uppercase(self: baml.String) -> bool {
 function baml.String.is_whitespace(self: baml.String) -> bool {
 }
 
+function baml.String.last_index_of(self: baml.String, search: string) -> int | null {
+}
+
 function baml.String.length(self: baml.String) -> int {
 }
 
@@ -847,6 +850,12 @@ function baml.String.lines(self: baml.String) -> string[] {
 }
 
 function baml.String.matches(self: baml.String, substring: string) -> bool {
+}
+
+function baml.String.pad_end(self: baml.String, target_length: int, pad: string) -> string {
+}
+
+function baml.String.pad_start(self: baml.String, target_length: int, pad: string) -> string {
 }
 
 function baml.String.repeat(self: baml.String, count: int) -> string {

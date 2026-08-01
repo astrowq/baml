@@ -219,6 +219,25 @@ class String {
     $rust_function
   }
 
+  /// Returns the **character index** of the last occurrence of `search`, or
+  /// `null` if not found. The mirror of `index_of`.
+  ///
+  /// Matches do not overlap: the result is the rightmost start position at which
+  /// `search` still fits. An empty `search` matches at the end and yields
+  /// `length()` (`index_of("")` yields 0).
+  ///
+  /// # Examples
+  /// ```
+  /// "hello world hello".last_index_of("hello")  // 12
+  /// "abcabc".last_index_of("b")                 // 4
+  /// "aaa".last_index_of("aa")                   // 1  (rightmost fit)
+  /// "😀hello".last_index_of("l")                // 4  (codepoints, not bytes)
+  /// "abc".last_index_of("z")                    // null
+  /// ```
+  function last_index_of(self, search: string) -> int? throws never {
+    $rust_function
+  }
+
   /// Returns the character at the given **codepoint index** as a
   /// one-character string.
   ///
@@ -274,6 +293,51 @@ class String {
   /// "hi".repeat(-1)  // ""
   /// ```
   function repeat(self, count: int) -> string throws never {
+    $rust_function
+  }
+
+  /// Pads the **start** of the string with `pad` until it is `target_length`
+  /// **characters** long, and returns the result.
+  ///
+  /// `pad` is repeated as many times as needed and truncated so the result is
+  /// exactly `target_length` codepoints — never longer. The string is returned
+  /// unchanged when it is already at least `target_length` long, when
+  /// `target_length` is negative, or when `pad` is empty (an empty `pad` can
+  /// never reach the target, so this does not loop forever).
+  ///
+  /// Lengths are counted in codepoints, matching `length()`, so padding a string
+  /// with multi-byte characters aligns by character and not by byte.
+  ///
+  /// # Examples
+  /// ```
+  /// "7".pad_start(3, "0")        // "007"
+  /// "42".pad_start(6, "ab")      // "abab42"
+  /// "42".pad_start(5, "ab")      // "aba42"   (pad truncated to fit)
+  /// "hello".pad_start(3, " ")    // "hello"   (already long enough)
+  /// "hi".pad_start(4, "")        // "hi"      (empty pad)
+  /// "é".pad_start(3, "😀")       // "😀😀é"   (codepoints, not bytes)
+  /// ```
+  function pad_start(self, target_length: int, pad: string) -> string throws never {
+    $rust_function
+  }
+
+  /// Pads the **end** of the string with `pad` until it is `target_length`
+  /// **characters** long, and returns the result.
+  ///
+  /// Identical to `pad_start` except the fill is appended rather than prepended:
+  /// `pad` is repeated and truncated so the result is exactly `target_length`
+  /// codepoints, and the string comes back unchanged when it is already long
+  /// enough, when `target_length` is negative, or when `pad` is empty.
+  ///
+  /// # Examples
+  /// ```
+  /// "7".pad_end(3, "0")        // "700"
+  /// "42".pad_end(6, "ab")      // "42abab"
+  /// "42".pad_end(5, "ab")      // "42aba"   (pad truncated to fit)
+  /// "hello".pad_end(3, " ")    // "hello"   (already long enough)
+  /// "name".pad_end(8, " ")     // "name    " (column alignment)
+  /// ```
+  function pad_end(self, target_length: int, pad: string) -> string throws never {
     $rust_function
   }
 

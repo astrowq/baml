@@ -361,3 +361,64 @@ fn codepoint_ops_match_std_oracle() {
         }
     }
 }
+
+#[test]
+fn char_last_index_of_matches_std_oracle() {
+    // The std reference: `rfind`'s byte offset converted to a codepoint index.
+    fn expected(s: &str, needle: &str) -> Option<usize> {
+        s.rfind(needle).map(|byte| s[..byte].chars().count())
+    }
+
+    // Multibyte cases where a byte offset and a codepoint index diverge, so a
+    // byte index leaking through would be caught.
+    let cases = [
+        "0123é56789abcdef",
+        "配信サービスxyz配信",
+        "🪙ab🪙cd🪙",
+        "aé bé cé dé eé fé gé hé",
+        "mixed_файлов_مرحبا_🪙_padding_to_force_a_flat_allocation_here!!",
+    ];
+
+    for s in cases {
+        let bex = BexStr::from(s);
+        // Every substring of `s` (by codepoint range) is a needle that occurs
+        // at least once, plus a needle that never occurs.
+        let chars: Vec<char> = s.chars().collect();
+        for a in 0..chars.len() {
+            for b in a..=chars.len() {
+                let needle: String = chars[a..b].iter().collect();
+                assert_eq!(
+                    bex.char_last_index_of(&needle),
+                    expected(s, &needle),
+                    "char_last_index_of({needle:?}) for {s:?}"
+                );
+            }
+        }
+        assert_eq!(bex.char_last_index_of("\u{fffd}zzz"), None);
+    }
+}
+
+#[test]
+fn char_last_index_of_edge_cases() {
+    // Rightmost occurrence, not the first.
+    assert_eq!(BexStr::from("abcabc").char_last_index_of("b"), Some(4));
+    // Overlapping candidates: the rightmost start that still fits.
+    assert_eq!(BexStr::from("aaa").char_last_index_of("aa"), Some(1));
+    // Absent needle.
+    assert_eq!(BexStr::from("abc").char_last_index_of("z"), None);
+    // An empty needle matches at the end (`char_index_of` yields 0 for it).
+    assert_eq!(BexStr::from("abc").char_last_index_of(""), Some(3));
+    assert_eq!(BexStr::from("").char_last_index_of(""), Some(0));
+    assert_eq!(BexStr::from("").char_last_index_of("a"), None);
+    // Codepoint-indexed, so the emoji ahead of the match counts as one.
+    assert_eq!(BexStr::from("😀hello").char_last_index_of("l"), Some(4));
+
+    // Concat and Slice variants resolve through `as_str()`/`as_bytes()` the
+    // same way Inline and Flat do.
+    let concat = BexStr::concat(BexStr::from("a".repeat(60)), BexStr::from("é needle tail"));
+    assert_eq!(concat.char_last_index_of("needle"), Some(62));
+    assert_eq!(
+        concat.substring_by_char(60, 69).char_last_index_of("é"),
+        Some(0)
+    );
+}
